@@ -1,0 +1,603 @@
+diff --git a/libfprint-tod/60-tudor-libfprint-tod.rules b/libfprint-tod/60-tudor-libfprint-tod.rules
+index 2ee7b8e..ca8bd5d 100644
+--- a/libfprint-tod/60-tudor-libfprint-tod.rules
++++ b/libfprint-tod/60-tudor-libfprint-tod.rules
+@@ -1,2 +1,4 @@
+ SUBSYSTEM=="usb", ATTRS{idVendor}=="06cb", ATTRS{idProduct}=="00be", ATTRS{dev}=="*", TEST=="power/control", ATTR{power/control}="auto", MODE="0660", GROUP="plugdev"
+-SUBSYSTEM=="usb", ATTRS{idVendor}=="06cb", ATTRS{idProduct}=="00be", ENV{LIBFPRINT_DRIVER}="Tudor TOD"
+\ No newline at end of file
++SUBSYSTEM=="usb", ATTRS{idVendor}=="06cb", ATTRS{idProduct}=="00be", ENV{LIBFPRINT_DRIVER}="Tudor TOD"
++SUBSYSTEM=="usb", ATTRS{idVendor}=="06cb", ATTRS{idProduct}=="00f0", ATTRS{dev}=="*", TEST=="power/control", ATTR{power/control}="auto", MODE="0660", GROUP="plugdev"
++SUBSYSTEM=="usb", ATTRS{idVendor}=="06cb", ATTRS{idProduct}=="00f0", ENV{LIBFPRINT_DRIVER}="Tudor TOD"
+\ No newline at end of file
+diff --git a/libfprint-tod/src/device.c b/libfprint-tod/src/device.c
+index fbe7010..8955e19 100644
+--- a/libfprint-tod/src/device.c
++++ b/libfprint-tod/src/device.c
+@@ -14,6 +14,7 @@ GType fpi_tod_shared_driver_get_type() {
+ 
+ static FpIdEntry tudor_ids[] = {
+     { .vid = 0x06cb, .pid = 0x00be },
++    { .vid = 0x06cb, .pid = 0x00f0 }, // HP EliteBook 840/845 G8 (Synaptics FS7605, "110" driver)
+ //  { .vid = 0x06cb, .pid = 0x00bd }, //TODO Check if it's also supported
+     { 0 }
+ };
+diff --git a/libtudor/download_driver.sh b/libtudor/download_driver.sh
+index 4450786..3a18f84 100644
+--- a/libtudor/download_driver.sh
++++ b/libtudor/download_driver.sh
+@@ -1,25 +1,16 @@
+ #!/bin/bash -e
++# PATCHED for HP EliteBook 840 G8 (Synaptics FS7605, 06cb:00f0):
++# Instead of downloading the Lenovo 00be driver, use the locally-staged HP "110"
++# driver DLLs (hpdrv/), copied into the 104 output names so no symbol churn is needed.
+ 
+ HASH_FILE="$1"
+ TMP_DIR="$2"
+ OUT_DIR="$3"
+-DLLS=${@:4}
++# remaining args ($4..) are the requested output DLL names (synaFpAdapter104.dll, synaWudfBioUsb104.dll)
+ 
+-mkdir -p "$TMP_DIR"
++SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
++HP="$SCRIPT_DIR/hpdrv"
+ 
+-#Download the driver executable and check hash
+-INSTALLER="$TMP_DIR/installer.exe"
+-wget https://download.lenovo.com/pccbbs/mobiles/r19fp02w.exe -O "$INSTALLER"
+-shasum "$INSTALLER" | cut -d" " -f1 | cmp - "$HASH_FILE"
+-
+-#Extract the driver
+-WINDRV="$TMP_DIR/windrv"
+-mkdir -p "$WINDRV"
+-innoextract -d "$WINDRV" "$INSTALLER"
+-
+-#Copy outputs
+ mkdir -p "$OUT_DIR"
+-for dll in $DLLS
+-do
+-    cp $(find "$WINDRV" -name "$dll") "$OUT_DIR/$dll"
+-done
+\ No newline at end of file
++cp "$HP/synaFpAdapter110.dll"  "$OUT_DIR/synaFpAdapter104.dll"
++cp "$HP/synaWudfBioUsb110.dll" "$OUT_DIR/synaWudfBioUsb104.dll"
+diff --git a/libtudor/meson.build b/libtudor/meson.build
+index 37b076a..b7cee30 100644
+--- a/libtudor/meson.build
++++ b/libtudor/meson.build
+@@ -34,6 +34,8 @@ libtudor_src = [
+     'src/winapi/suspend.c',
+     'src/winapi/io.c',
+     'src/winapi/system.c',
++    'src/winapi/firmware.c',
++    'src/winapi/user32.c',
+ 
+     'src/winapi/crypt/rsa_aes.c',
+     'src/winapi/crypt/evp_digest.c',
+diff --git a/libtudor/src/winapi/crypt/crypt.c b/libtudor/src/winapi/crypt/crypt.c
+index b842dc4..8e7ad0d 100644
+--- a/libtudor/src/winapi/crypt/crypt.c
++++ b/libtudor/src/winapi/crypt/crypt.c
+@@ -1,5 +1,7 @@
+ #include <openssl/ecdsa.h>
+ #include <openssl/rand.h>
++#include <openssl/evp.h>
++#include <string.h>
+ #include "crypt.h"
+ 
+ __winfnc BOOL CryptAcquireContextA(struct crypt_provider **prov, const char *cont_name, const char *prov_name, DWORD prov_type, DWORD flags) {
+@@ -33,6 +35,9 @@ __winfnc BOOL CryptImportKey(struct crypt_provider *prov, const BLOBHEADER *data
+     if(!key) { winerr_set_errno(); return FALSE; }
+     key->prov = prov;
+     key->key_data = NULL;
++    memset(key->iv, 0, sizeof(key->iv));
++    key->mode = CRYPT_MODE_CBC;
++    key->padding = PKCS5_PADDING;
+ 
+     if(data->bType == type_PLAINTEXTKEYBLOB) {
+         //Copy plaintext data
+@@ -73,6 +78,106 @@ __winfnc BOOL CryptDestroyKey(struct crypt_key *key) {
+ }
+ WINAPI(CryptDestroyKey)
+ 
++/* ---- CAPI symmetric (AES) crypto, backed by OpenSSL EVP ---------------------
++ * Used by the HP "110" driver's secure-pairing handshake. The raw key bytes are
++ * in key->plain_data (imported via CryptImportKey/PLAINTEXTKEYBLOB); IV and mode
++ * come from CryptSetKeyParam. Default mode CBC, default padding PKCS#7. */
++
++static const EVP_CIPHER *capi_aes_cipher(struct crypt_key *key) {
++    int ecb = (key->mode == CRYPT_MODE_ECB);
++    switch(key->plain_size) {
++        case 16: return ecb ? EVP_aes_128_ecb() : EVP_aes_128_cbc();
++        case 24: return ecb ? EVP_aes_192_ecb() : EVP_aes_192_cbc();
++        case 32: return ecb ? EVP_aes_256_ecb() : EVP_aes_256_cbc();
++        default: return NULL;
++    }
++}
++
++__winfnc BOOL CryptSetKeyParam(struct crypt_key *key, DWORD param, const BYTE *data, DWORD flags) {
++    switch(param) {
++        case KP_IV:      if(data) memcpy(key->iv, data, sizeof(key->iv)); return TRUE;
++        case KP_MODE:    if(data) key->mode = *(const DWORD*) data; return TRUE;
++        case KP_PADDING: if(data) key->padding = *(const DWORD*) data; return TRUE;
++        case KP_MODE_BITS: return TRUE;
++        default: log_warn("CryptSetKeyParam: unsupported param %u", (unsigned) param); return TRUE;
++    }
++}
++WINAPI(CryptSetKeyParam)
++
++__winfnc BOOL CryptGetKeyParam(struct crypt_key *key, DWORD param, BYTE *data, DWORD *data_len, DWORD flags) {
++    DWORD v;
++    switch(param) {
++        case KP_IV:
++            if(!data) { *data_len = sizeof(key->iv); return TRUE; }
++            if(*data_len < sizeof(key->iv)) { *data_len = sizeof(key->iv); winerr_set_code(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
++            memcpy(data, key->iv, sizeof(key->iv)); *data_len = sizeof(key->iv); return TRUE;
++        case KP_BLOCKLEN: v = 128; goto ret_dword;
++        case KP_KEYLEN:   v = (DWORD)(key->plain_size * 8); goto ret_dword;
++        case KP_MODE:     v = key->mode; goto ret_dword;
++        case KP_PADDING:  v = key->padding; goto ret_dword;
++        default: log_warn("CryptGetKeyParam: unsupported param %u", (unsigned) param); winerr_set(); return FALSE;
++    }
++ret_dword:
++    if(!data) { *data_len = sizeof(DWORD); return TRUE; }
++    if(*data_len < sizeof(DWORD)) { *data_len = sizeof(DWORD); winerr_set_code(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
++    memcpy(data, &v, sizeof(DWORD)); *data_len = sizeof(DWORD); return TRUE;
++}
++WINAPI(CryptGetKeyParam)
++
++__winfnc BOOL CryptEncrypt(struct crypt_key *key, struct crypt_hash *hash, BOOL final, DWORD flags, BYTE *data, DWORD *data_len, DWORD buf_len) {
++    const int block = 16;
++    if(hash) log_warn("CryptEncrypt: hHash unsupported, ignoring");
++    const EVP_CIPHER *cipher = capi_aes_cipher(key);
++    if(!cipher) { winerr_set(); return FALSE; }
++
++    DWORD in_len = *data_len;
++    DWORD out_needed = final ? ((in_len / block) + 1) * block : in_len;
++    if(!data) { *data_len = out_needed; return TRUE; }
++    if(final && buf_len < out_needed) { *data_len = out_needed; winerr_set_code(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
++
++    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
++    if(!ctx) { winerr_set(); return FALSE; }
++    if(EVP_EncryptInit_ex(ctx, cipher, NULL, (const unsigned char*) key->plain_data, key->mode == CRYPT_MODE_ECB ? NULL : key->iv) != 1) { EVP_CIPHER_CTX_free(ctx); winerr_set(); return FALSE; }
++    EVP_CIPHER_CTX_set_padding(ctx, final ? 1 : 0);
++
++    int outl = 0, tmpl = 0;
++    if(EVP_EncryptUpdate(ctx, data, &outl, data, (int) in_len) != 1) { EVP_CIPHER_CTX_free(ctx); winerr_set(); return FALSE; }
++    if(EVP_EncryptFinal_ex(ctx, data + outl, &tmpl) != 1) { EVP_CIPHER_CTX_free(ctx); winerr_set(); return FALSE; }
++    EVP_CIPHER_CTX_free(ctx);
++
++    DWORD total = (DWORD)(outl + tmpl);
++    if(!final && key->mode != CRYPT_MODE_ECB && total >= 16) memcpy(key->iv, data + total - 16, 16); /* CBC chaining */
++    *data_len = total;
++    return TRUE;
++}
++WINAPI(CryptEncrypt)
++
++__winfnc BOOL CryptDecrypt(struct crypt_key *key, struct crypt_hash *hash, BOOL final, DWORD flags, BYTE *data, DWORD *data_len) {
++    if(hash) log_warn("CryptDecrypt: hHash unsupported, ignoring");
++    const EVP_CIPHER *cipher = capi_aes_cipher(key);
++    if(!cipher) { winerr_set(); return FALSE; }
++
++    DWORD in_len = *data_len;
++    unsigned char next_iv[16];
++    int chain = (!final && key->mode != CRYPT_MODE_ECB && in_len >= 16);
++    if(chain) memcpy(next_iv, data + in_len - 16, 16);
++
++    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
++    if(!ctx) { winerr_set(); return FALSE; }
++    if(EVP_DecryptInit_ex(ctx, cipher, NULL, (const unsigned char*) key->plain_data, key->mode == CRYPT_MODE_ECB ? NULL : key->iv) != 1) { EVP_CIPHER_CTX_free(ctx); winerr_set(); return FALSE; }
++    EVP_CIPHER_CTX_set_padding(ctx, final ? 1 : 0);
++
++    int outl = 0, tmpl = 0;
++    if(EVP_DecryptUpdate(ctx, data, &outl, data, (int) in_len) != 1) { EVP_CIPHER_CTX_free(ctx); winerr_set(); return FALSE; }
++    if(EVP_DecryptFinal_ex(ctx, data + outl, &tmpl) != 1) { EVP_CIPHER_CTX_free(ctx); winerr_set(); return FALSE; }
++    EVP_CIPHER_CTX_free(ctx);
++
++    if(chain) memcpy(key->iv, next_iv, 16); /* CBC chaining */
++    *data_len = (DWORD)(outl + tmpl);
++    return TRUE;
++}
++WINAPI(CryptDecrypt)
++
+ __winfnc BOOL CryptCreateHash(struct crypt_provider *prov, ALG_ID alg_id, struct crypt_key *key, DWORD flags, struct crypt_hash **out) {
+     //Get the algorithm
+     struct crypt_hash_algorithm *algo;
+diff --git a/libtudor/src/winapi/crypt/crypt.h b/libtudor/src/winapi/crypt/crypt.h
+index 95559ff..4fb7306 100644
+--- a/libtudor/src/winapi/crypt/crypt.h
++++ b/libtudor/src/winapi/crypt/crypt.h
+@@ -22,6 +22,11 @@ struct crypt_key {
+ 
+     void *plain_data;
+     size_t plain_size;
++
++    /* CAPI symmetric (CryptSetKeyParam) state */
++    unsigned char iv[16];
++    DWORD mode;     /* CRYPT_MODE_* (default CBC) */
++    DWORD padding;  /* PKCS5_PADDING default */
+ };
+ 
+ extern struct crypt_provider crypt_prov_rsa_aes;
+diff --git a/libtudor/src/winapi/crypt/wincrypt.h b/libtudor/src/winapi/crypt/wincrypt.h
+index e7b5cef..12e8b5a 100644
+--- a/libtudor/src/winapi/crypt/wincrypt.h
++++ b/libtudor/src/winapi/crypt/wincrypt.h
+@@ -160,13 +160,31 @@ typedef struct {
+     BYTE rgbKeyData[];
+ } PLAINTEXTKEYBLOB;
+ 
+-#define HP_ALGID 0x0001 
++#define HP_ALGID 0x0001
+ #define HP_HASHVAL 0x0002
+ #define HP_HASHSIZE 0x0004
+ #define HP_HMAC_INFO 0x0005
+ #define HP_TLS1PRF_LABEL 0x0006
+ #define HP_TLS1PRF_SEED 0x0007
+ 
++/* CryptSetKeyParam / CryptGetKeyParam parameters */
++#define KP_IV       1
++#define KP_PADDING  3
++#define KP_MODE     4
++#define KP_MODE_BITS 5
++#define KP_ALGID    7
++#define KP_BLOCKLEN 8
++#define KP_KEYLEN   9
++
++/* Cipher modes */
++#define CRYPT_MODE_CBC 1
++#define CRYPT_MODE_ECB 2
++#define CRYPT_MODE_OFB 3
++#define CRYPT_MODE_CFB 4
++
++/* Padding methods */
++#define PKCS5_PADDING 1
++
+ typedef struct {
+     ALG_ID HashAlgid;
+     BYTE *pbInnerString;
+diff --git a/libtudor/src/winapi/firmware.c b/libtudor/src/winapi/firmware.c
+new file mode 100644
+index 0000000..a8b0ccc
+--- /dev/null
++++ b/libtudor/src/winapi/firmware.c
+@@ -0,0 +1,86 @@
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdint.h>
++#include "internal.h"
++#include <tudor/log.h>
++
++/* Implements kernel32!GetSystemFirmwareTable for the HP "110" driver, which the
++ * Synaptics adapter calls (RSMB / raw SMBIOS) to derive a stable host identity
++ * for secure pairing. The Linux DMI tables are root-only (0400), and the CLI
++ * drops privileges after USB setup, so we read + cache them in a load-time
++ * constructor (runs as root, before the privilege drop). */
++
++static uint8_t *smbios_blob = NULL;
++static size_t   smbios_blob_len = 0;
++
++static uint8_t *read_file(const char *path, size_t *out_len) {
++    FILE *f = fopen(path, "rb");
++    if(!f) return NULL;
++    if(fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
++    long sz = ftell(f);
++    if(sz <= 0) { fclose(f); return NULL; }
++    rewind(f);
++    uint8_t *buf = (uint8_t*) malloc((size_t) sz);
++    if(!buf) { fclose(f); return NULL; }
++    size_t rd = fread(buf, 1, (size_t) sz, f);
++    fclose(f);
++    if(rd != (size_t) sz) { free(buf); return NULL; }
++    *out_len = (size_t) sz;
++    return buf;
++}
++
++__constr static void init_smbios_table() {
++    size_t ep_len = 0, dmi_len = 0;
++    uint8_t *ep  = read_file("/sys/firmware/dmi/tables/smbios_entry_point", &ep_len);
++    uint8_t *dmi = read_file("/sys/firmware/dmi/tables/DMI", &dmi_len);
++    if(!dmi || dmi_len == 0) { free(ep); free(dmi); return; }
++
++    uint8_t major = 2, minor = 0, dmirev = 0;
++    if(ep && ep_len >= 10 && memcmp(ep, "_SM3_", 5) == 0) {
++        major = ep[7]; minor = ep[8]; dmirev = ep[9];
++    } else if(ep && ep_len >= 8 && memcmp(ep, "_SM_", 4) == 0) {
++        major = ep[6]; minor = ep[7];
++    }
++
++    /* RawSMBIOSData: Used20CallingMethod(1) Major(1) Minor(1) DmiRevision(1) Length(u32 LE) Data[] */
++    smbios_blob_len = 8 + dmi_len;
++    smbios_blob = (uint8_t*) malloc(smbios_blob_len);
++    if(!smbios_blob) { smbios_blob_len = 0; free(ep); free(dmi); return; }
++    smbios_blob[0] = 0;
++    smbios_blob[1] = major;
++    smbios_blob[2] = minor;
++    smbios_blob[3] = dmirev;
++    smbios_blob[4] = (uint8_t)(dmi_len & 0xff);
++    smbios_blob[5] = (uint8_t)((dmi_len >> 8) & 0xff);
++    smbios_blob[6] = (uint8_t)((dmi_len >> 16) & 0xff);
++    smbios_blob[7] = (uint8_t)((dmi_len >> 24) & 0xff);
++    memcpy(smbios_blob + 8, dmi, dmi_len);
++    log_info("Cached SMBIOS firmware table for GetSystemFirmwareTable (%zu bytes, v%u.%u)",
++             smbios_blob_len, major, minor);
++    free(ep); free(dmi);
++}
++
++__winfnc UINT GetSystemFirmwareTable(DWORD sig, DWORD table_id, void *buf, DWORD buf_size) {
++    (void) table_id;
++    if(sig != 0x52534D42 /* 'RSMB' */ && sig != 0x424D5352) {
++        log_warn("GetSystemFirmwareTable: unsupported provider 0x%08x", (unsigned) sig);
++        return 0;
++    }
++    if(!smbios_blob || smbios_blob_len == 0) {
++        log_warn("GetSystemFirmwareTable: SMBIOS table not available");
++        return 0;
++    }
++    if(buf && buf_size >= smbios_blob_len) memcpy(buf, smbios_blob, smbios_blob_len);
++    return (UINT) smbios_blob_len;
++}
++WINAPI(GetSystemFirmwareTable)
++
++/* powrprof!CallNtPowerInformation — the driver queries power info during init.
++ * Report success with a zeroed output buffer (no special power capabilities). */
++__winfnc NTSTATUS CallNtPowerInformation(DWORD level, void *in_buf, DWORD in_len, void *out_buf, DWORD out_len) {
++    (void) level; (void) in_buf; (void) in_len;
++    if(out_buf && out_len) memset(out_buf, 0, out_len);
++    return 0; /* STATUS_SUCCESS */
++}
++WINAPI(CallNtPowerInformation)
+diff --git a/libtudor/src/winapi/module.c b/libtudor/src/winapi/module.c
+index cb57daf..3a73487 100644
+--- a/libtudor/src/winapi/module.c
++++ b/libtudor/src/winapi/module.c
+@@ -15,6 +15,7 @@ static void module_destr(struct winmodule *module) {
+ }
+ 
+ struct winmodule *winmodule_find(const char *name) {
++    if(!name) return NULL;
+     cant_fail_ret(pthread_rwlock_rdlock(&modules_lock));
+ 
+     struct winmodule *module = NULL;
+@@ -80,6 +81,11 @@ __winfnc HANDLE LoadLibraryExW(const char16_t *name, HANDLE file, DWORD flags) {
+ }
+ WINAPI(LoadLibraryExW)
+ 
++__winfnc HANDLE LoadLibraryW(const char16_t *name) {
++    return LoadLibraryExW(name, NULL, 0);
++}
++WINAPI(LoadLibraryW)
++
+ __winfnc BOOL FreeLibrary(HANDLE handle) {
+     winhandle_destroy(handle);
+     return TRUE;
+@@ -87,12 +93,16 @@ __winfnc BOOL FreeLibrary(HANDLE handle) {
+ WINAPI(FreeLibrary)
+ 
+ __winfnc HANDLE GetModuleHandleA(const char *name) {
++    /* NULL name => handle to the "main"/currently-executing module */
++    if(!name) return cur_module ? cur_module->handle : NULL;
+     struct winmodule *module = (struct winmodule*) winmodule_find(name);
+     return module ? module->handle : NULL;
+ }
+ WINAPI(GetModuleHandleA)
+ 
+ __winfnc HANDLE GetModuleHandleW(const char16_t *name) {
++    /* NULL name => handle to the "main"/currently-executing module */
++    if(!name) return cur_module ? cur_module->handle : NULL;
+     char *cname = winstr_to_str(name);
+     struct winmodule *module = (struct winmodule*) winmodule_find(cname);
+     free(cname);
+diff --git a/libtudor/src/winapi/user32.c b/libtudor/src/winapi/user32.c
+new file mode 100644
+index 0000000..d299b13
+--- /dev/null
++++ b/libtudor/src/winapi/user32.c
+@@ -0,0 +1,167 @@
++#include <stdlib.h>
++#include <string.h>
++#include <stdint.h>
++#include "internal.h"
++#include <tudor/log.h>
++
++/* Minimal USER32 window layer for the HP "110" driver's CPowerStateWindow
++ * (a hidden message window used for power-broadcast handling). We don't deliver
++ * real messages (not needed for enroll/verify), but we implement enough that
++ * the driver can register a class, create the window (incl. WM_NCCREATE /
++ * WM_CREATE so it can stash its 'this' pointer via SetWindowLongPtrW), and run
++ * an (empty) message loop without crashing. */
++
++#define WM_CREATE   0x0001
++#define WM_NCCREATE 0x0081
++#define GWLP_WNDPROC  (-4)
++#define GWLP_USERDATA (-21)
++
++typedef ULONG_PTR UINT_PTR;
++typedef LONG_PTR __winfnc (*WNDPROC)(void *hwnd, unsigned int msg, UINT_PTR wparam, LONG_PTR lparam);
++
++typedef struct {
++    unsigned int cbSize, style;
++    WNDPROC lpfnWndProc;
++    int cbClsExtra, cbWndExtra;
++    void *hInstance, *hIcon, *hCursor, *hbrBackground;
++    const char16_t *lpszMenuName, *lpszClassName;
++    void *hIconSm;
++} WNDCLASSEXW;
++
++typedef struct {
++    void *lpCreateParams, *hInstance, *hMenu, *hwndParent;
++    int cy, cx, y, x;
++    long style;
++    const char16_t *lpszName, *lpszClass;
++    DWORD dwExStyle;
++} CREATESTRUCTW;
++
++struct wndclass { char *name; WNDPROC proc; struct wndclass *next; };
++static struct wndclass *classes;
++
++struct window { WNDPROC proc; LONG_PTR userdata; LONG_PTR extra[32]; };
++
++__winfnc WORD RegisterClassExW(const WNDCLASSEXW *cls) {
++    if(!cls) return 0;
++    struct wndclass *c = (struct wndclass*) calloc(1, sizeof(*c));
++    c->name = winstr_to_str(cls->lpszClassName);
++    c->proc = cls->lpfnWndProc;
++    c->next = classes;
++    classes = c;
++    return 1; /* non-zero ATOM */
++}
++WINAPI(RegisterClassExW)
++
++__winfnc BOOL UnregisterClassW(const char16_t *name, void *inst) {
++    (void) name; (void) inst;
++    return TRUE;
++}
++WINAPI(UnregisterClassW)
++
++__winfnc void *CreateWindowExW(DWORD exstyle, const char16_t *clsname, const char16_t *winname,
++                               DWORD style, int x, int y, int w, int h,
++                               void *parent, void *menu, void *inst, void *param) {
++    struct window *win = (struct window*) calloc(1, sizeof(*win));
++    if(!win) return NULL;
++
++    char *cname = winstr_to_str(clsname);
++    for(struct wndclass *c = classes; c; c = c->next) {
++        if(c->name && cname && strcmp(c->name, cname) == 0) { win->proc = c->proc; break; }
++    }
++    free(cname);
++
++    if(win->proc) {
++        CREATESTRUCTW cs = {0};
++        cs.lpCreateParams = param; cs.hInstance = inst; cs.hMenu = menu; cs.hwndParent = parent;
++        cs.cy = h; cs.cx = w; cs.y = y; cs.x = x; cs.style = (long) style;
++        cs.lpszName = winname; cs.lpszClass = clsname; cs.dwExStyle = exstyle;
++        if(!win->proc(win, WM_NCCREATE, 0, (LONG_PTR) &cs)) { free(win); return NULL; }
++        win->proc(win, WM_CREATE, 0, (LONG_PTR) &cs);
++    }
++    return win;
++}
++WINAPI(CreateWindowExW)
++
++__winfnc BOOL DestroyWindow(void *hwnd) { free(hwnd); return TRUE; }
++WINAPI(DestroyWindow)
++
++__winfnc LONG_PTR SetWindowLongPtrW(void *hwnd, int idx, LONG_PTR val) {
++    struct window *w = (struct window*) hwnd;
++    LONG_PTR old = 0;
++    if(!w) return 0;
++    if(idx == GWLP_USERDATA)      { old = w->userdata; w->userdata = val; }
++    else if(idx == GWLP_WNDPROC)  { old = (LONG_PTR) w->proc; w->proc = (WNDPROC) val; }
++    else if(idx >= 0 && idx < (int) sizeof(w->extra) - 8) { old = w->extra[idx/8]; w->extra[idx/8] = val; }
++    return old;
++}
++WINAPI(SetWindowLongPtrW)
++
++__winfnc LONG_PTR GetWindowLongPtrW(void *hwnd, int idx) {
++    struct window *w = (struct window*) hwnd;
++    if(!w) return 0;
++    if(idx == GWLP_USERDATA)      return w->userdata;
++    if(idx == GWLP_WNDPROC)       return (LONG_PTR) w->proc;
++    if(idx >= 0 && idx < (int) sizeof(w->extra) - 8) return w->extra[idx/8];
++    return 0;
++}
++WINAPI(GetWindowLongPtrW)
++
++__winfnc LONG_PTR DefWindowProcW(void *hwnd, unsigned int msg, UINT_PTR wp, LONG_PTR lp) {
++    (void) hwnd; (void) wp; (void) lp;
++    if(msg == WM_NCCREATE) return 1; /* allow window creation */
++    return 0;
++}
++WINAPI(DefWindowProcW)
++
++__winfnc LONG_PTR CallWindowProcW(WNDPROC proc, void *hwnd, unsigned int msg, UINT_PTR wp, LONG_PTR lp) {
++    if(!proc) return 0;
++    return proc(hwnd, msg, wp, lp);
++}
++WINAPI(CallWindowProcW)
++
++/* Message loop: report no messages / WM_QUIT so any driver pump exits cleanly. */
++__winfnc BOOL GetMessageW(void *msg, void *hwnd, unsigned int min, unsigned int max) {
++    (void) msg; (void) hwnd; (void) min; (void) max;
++    return 0; /* WM_QUIT */
++}
++WINAPI(GetMessageW)
++
++__winfnc BOOL PeekMessageW(void *msg, void *hwnd, unsigned int min, unsigned int max, unsigned int rem) {
++    (void) msg; (void) hwnd; (void) min; (void) max; (void) rem;
++    return 0; /* no message available */
++}
++WINAPI(PeekMessageW)
++
++__winfnc BOOL TranslateMessage(const void *msg) { (void) msg; return FALSE; }
++WINAPI(TranslateMessage)
++
++__winfnc LONG_PTR DispatchMessageW(const void *msg) { (void) msg; return 0; }
++WINAPI(DispatchMessageW)
++
++__winfnc BOOL PostThreadMessageW(DWORD tid, unsigned int msg, UINT_PTR wp, LONG_PTR lp) {
++    (void) tid; (void) msg; (void) wp; (void) lp;
++    return TRUE;
++}
++WINAPI(PostThreadMessageW)
++
++__winfnc BOOL PostMessageW(void *hwnd, unsigned int msg, UINT_PTR wp, LONG_PTR lp) {
++    (void) hwnd; (void) msg; (void) wp; (void) lp;
++    return TRUE;
++}
++WINAPI(PostMessageW)
++
++__winfnc void PostQuitMessage(int code) { (void) code; }
++WINAPI(PostQuitMessage)
++
++/* WTSAPI32 session-change notifications — not needed for enroll/verify; succeed. */
++__winfnc BOOL WTSRegisterSessionNotification(void *hwnd, DWORD flags) {
++    (void) hwnd; (void) flags;
++    return TRUE;
++}
++WINAPI(WTSRegisterSessionNotification)
++
++__winfnc BOOL WTSUnRegisterSessionNotification(void *hwnd) {
++    (void) hwnd;
++    return TRUE;
++}
++WINAPI(WTSUnRegisterSessionNotification)
+diff --git a/libtudor/src/winapi/wdf/usb.c b/libtudor/src/winapi/wdf/usb.c
+index 06836b3..915e1b6 100644
+--- a/libtudor/src/winapi/wdf/usb.c
++++ b/libtudor/src/winapi/wdf/usb.c
+@@ -1,3 +1,4 @@
++#include <stdlib.h>
+ #include "internal.h"
+ 
+ typedef struct {
+@@ -434,6 +435,13 @@ static NTSTATUS usb_transfer_start(struct winwdf_request *req, struct transfer_r
+ 
+     //Initialize remaining transfer fields
+     ctx->transfer->timeout = (timeout > 0) ? (unsigned int) timeout : 0;
++    /* DIAGNOSTIC: optionally clamp infinite (0) timeouts to a finite value so a
++     * stuck read (e.g. enumerating an orphan secure-DB record during open)
++     * fails instead of hanging forever. Opt-in via SYNA_USB_TIMEOUT=<ms>. */
++    if(ctx->transfer->timeout == 0) {
++        const char *e = getenv("SYNA_USB_TIMEOUT");
++        if(e) { int v = atoi(e); if(v > 0) ctx->transfer->timeout = (unsigned int) v; }
++    }
+     ctx->transfer->callback = (libusb_transfer_cb_fn) pipe_transfer_callback;
+     ctx->transfer->user_data = ctx;
+ 
+diff --git a/meson.build b/meson.build
+index 54d6dd9..936bfac 100644
+--- a/meson.build
++++ b/meson.build
+@@ -7,6 +7,6 @@ INSTALL_DIR = '/sbin/tudor'
+ 
+ subdir('libtudor')
+ subdir('cli')
+-subdir('tudor-host')
+-subdir('tudor-host-launcher')
+-subdir('libfprint-tod')
+\ No newline at end of file
++# subdir('tudor-host')             # fprintd-integration path; re-enable after CLI test
++# subdir('tudor-host-launcher')    # fprintd-integration path; re-enable after CLI test
++# subdir('libfprint-tod')          # needs udev.pc; re-enable after CLI test works
+\ No newline at end of file

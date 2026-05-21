@@ -1,0 +1,104 @@
+diff --git a/libfprint/drivers/synaptics/bmkt_message.c b/libfprint/drivers/synaptics/bmkt_message.c
+index d297156..bc0302b 100644
+--- a/libfprint/drivers/synaptics/bmkt_message.c
++++ b/libfprint/drivers/synaptics/bmkt_message.c
+@@ -154,13 +154,23 @@ parse_db_cap_report (bmkt_msg_resp_t *msg_resp, bmkt_response_t *resp)
+   bmkt_get_db_capacity_resp_t *db_cap_resp = &resp->response.db_cap_resp;
+   int offset = 0;
+ 
+-  if (msg_resp->payload_len < 2 || msg_resp->payload_len > 4)
+-    return BMKT_UNRECOGNIZED_MESSAGE;
+-
+-  db_cap_resp->total = extract8 (msg_resp->payload, &offset);
+-  db_cap_resp->empty = extract8 (msg_resp->payload, &offset);
+-
+-  if (msg_resp->payload_len == 4)
++  /* DIAGNOSTIC: dump the raw capacity payload so we can decode this firmware's
++   * format (the stock parser only accepts 2-4 bytes). Be tolerant: never fail. */
++  {
++    GString *hex = g_string_new (NULL);
++    for (int i = 0; i < msg_resp->payload_len; i++)
++      g_string_append_printf (hex, "%02x ", msg_resp->payload[i]);
++    g_message ("SYNA DB CAPACITY raw: payload_len=%u bytes=[ %s]",
++               msg_resp->payload_len, hex->str);
++    g_string_free (hex, TRUE);
++  }
++
++  if (msg_resp->payload_len >= 2)
++    {
++      db_cap_resp->total = extract8 (msg_resp->payload, &offset);
++      db_cap_resp->empty = extract8 (msg_resp->payload, &offset);
++    }
++  if (msg_resp->payload_len >= 4)
+     {
+       db_cap_resp->bad_slots = extract8 (msg_resp->payload, &offset);
+       db_cap_resp->corrupt_templates = extract8 (msg_resp->payload, &offset);
+diff --git a/libfprint/drivers/synaptics/synaptics.c b/libfprint/drivers/synaptics/synaptics.c
+index 0d91805..d2110d6 100644
+--- a/libfprint/drivers/synaptics/synaptics.c
++++ b/libfprint/drivers/synaptics/synaptics.c
+@@ -1028,6 +1028,22 @@ enroll (FpDevice *device)
+   user_id_len = strlen (user_id);
+   user_id_len = MIN (BMKT_MAX_USER_ID_LEN, user_id_len);
+ 
++  /* DIAGNOSTIC: optionally cap the user_id length to probe a firmware limit.
++   * Set SYNA_UID_MAX=<n> in the environment. */
++  {
++    const gchar *cap = g_getenv ("SYNA_UID_MAX");
++    if (cap != NULL)
++      {
++        gssize c = (gssize) g_ascii_strtoll (cap, NULL, 10);
++        if (c > 0 && c < user_id_len)
++          {
++            user_id_len = c;
++            user_id[user_id_len] = '\0';
++          }
++      }
++    g_message ("SYNA ENROLL: user_id_len=%zd user_id='%s'", (gssize) user_id_len, user_id);
++  }
++
+   /* We currently always use finger 1 from the devices point of view */
+   finger = 1;
+ 
+@@ -1338,6 +1354,14 @@ dev_probe (FpDevice *device)
+   fp_dbg ("Target: %d", self->mis_version.target);
+   fp_dbg ("Product: %d", self->mis_version.product);
+ 
++  /* DIAGNOSTIC: surface the security/provisioning fields. */
++  g_message ("SYNA PROBE: security=0x%04x iface=%u device_type=%u silicon_rev=%u "
++             "formal_release=%u platform=%u patch=%u",
++             self->mis_version.security, self->mis_version.iface,
++             self->mis_version.device_type, self->mis_version.silicon_rev,
++             self->mis_version.formal_release, self->mis_version.platform,
++             self->mis_version.patch);
++
+   synaptics_sensor_cmd (self, 0, BMKT_CMD_FPS_INIT, NULL, 0, prob_msg_cb);
+ 
+   return;
+@@ -1361,10 +1385,25 @@ fps_init_msg_cb (FpiDeviceSynaptics *self,
+       return;
+     }
+ 
++  /* DIAGNOSTIC: this callback is reused for our follow-up DB-capacity query.
++   * When that response comes back, log the counts and finish opening. */
++  if (resp->response_id == BMKT_RSP_DATABASE_CAPACITY_REPORT)
++    {
++      bmkt_get_db_capacity_resp_t *c = &resp->response.db_cap_resp;
++      g_message ("SYNA DB CAPACITY: total=%u empty=%u used=%u bad_slots=%u corrupt=%u",
++                 c->total, c->empty, (guint) (c->total - c->empty),
++                 c->bad_slots, c->corrupt_templates);
++      fpi_device_open_complete (FP_DEVICE (self), NULL);
++      return;
++    }
++
+   /* BMKT_OPERATION_DENIED is returned if the sensor is already initialized */
+   if (resp->result == BMKT_SUCCESS || resp->result == BMKT_OPERATION_DENIED)
+     {
+-      fpi_device_open_complete (FP_DEVICE (self), NULL);
++      /* DIAGNOSTIC: queue a follow-up capacity query on the same SSM. A continued
++       * command must pass callback == NULL; this same callback then fires again
++       * with the capacity response (handled above). */
++      synaptics_sensor_cmd (self, 0, BMKT_CMD_GET_DATABASE_CAPACITY, NULL, 0, NULL);
+     }
+   else if (resp->result == BMKT_FP_SYSTEM_BUSY)
+     {
