@@ -5,6 +5,42 @@ Format is narrative rather than release-versioned — this is a research log.
 
 ## [unreleased]
 
+### 2026-11-06 — EliteBook 830 G7 (`06cb:00df`) WORKING end-to-end
+- The full chain now works on Omarchy/Arch: sensor → `tudor_host` → `libtudor_tod.so`
+  → fprintd → `sudo`, polkit, and the lock screen. Right index enrolled and
+  verified (`Verify GUID ... -> does match`).
+- Consolidated the six incremental patches into one self-contained
+  `patches/synaTudor-hp110-storage-ipc.patch` (50 files), verified to apply to synaTudor
+  `31dfdb0`, build, and pass all 8 offline tests from a clean clone.
+- `tudor_host` no longer `abort()`s on a defined adapter failure. Duplicate finger,
+  failed commit, and dead capture are reported as `IPC_MSG_RESP_ERROR`, so a failed
+  enroll no longer tears down the device session or crashes fprintd.
+- Added `IPC_MSG_RESP_LIST_RECORDS` + `libfprint-tod/src/list.c` so the module can
+  enumerate on-sensor records and delete ones it did not create.
+- Root-caused the recurring "enrollment failed / duplicate" loop: the vendor query
+  API cannot see every stored record, so `DeleteEnrolledFingers` reported
+  `Deleted 0 records` while an orphaned right-index template stayed on the sensor.
+  Only the database-wide `EraseDatabase` clears it; added `scripts/syna-erase-db.sh`
+  (approval-gated, root) and documented the CLI input order the erase requires.
+- Fixed two install defects: the launcher unit pointed at `/sbin/tudor`, and the
+  udev rule landed in `/usr/lib/udev` where systemd-udev never reads it. Now
+  `scripts/install-tudor-stack.sh` puts it in `rules.d` and uses `TAG+="uaccess"`
+  instead of the nonexistent `plugdev` group.
+- Captured the `libfprint-tod` and `libfprint-git-compat` PKGBUILDs under
+  `packaging/`; fprintd needs a TOD-capable libfprint.
+
+### 2026-11-05 — EliteBook 830 G7 (`06cb:00df`) local test preparation
+- Added a focused source patch for the HP package-supported `00df` ID and
+  a `TUDOR_OPEN_ONLY=1` CLI path that skips every post-open sensor command.
+- Reworked the run wrapper for a finite 60 s attempt, retained the 8000 ms USB
+  timeout, moved host pairing state/logs to checkout-local `state/`, and removed
+  automatic autosuspend/service changes.
+- Static open-path analysis found no way to disable the proprietary driver's
+  ownership-change firmware update path before `tudor_open` returns. The wrapper
+  therefore requires separate `TUDOR_FIRMWARE_WRITE_APPROVED=1` approval; this
+  records approval rather than preventing firmware writes. No hardware test was
+  executed.
+
 ### Track 1 — USB autosuspend (SOLVED)
 - **Diagnosed:** `fprintd` enroll failed with `Corrupted message received` /
   `Ignoring device due to initialization error: unsupported firmware version`,

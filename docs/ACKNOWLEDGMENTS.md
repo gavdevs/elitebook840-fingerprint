@@ -8,9 +8,9 @@ due — and pointers for anyone continuing.
 - **[Popax21/synaTudor](https://github.com/Popax21/synaTudor)** — the driver-relinking
   framework this whole port is built on. PE-loads the real Synaptics Windows driver and
   shims Windows/WDF/crypto so it runs on Linux, exposed via a libfprint TOD module.
-  Base commit for our port: `31dfdb0`. Our changes:
-  `patches/synaTudor-hp110.patch`. **Upstreaming this would help every EliteBook
-  840/845 G8 owner** — see issues
+  Base commit for our port: `31dfdb0`. All of our changes are in the single
+  `patches/synaTudor-hp110-storage-ipc.patch`. **Upstreaming this would help every EliteBook
+  830 G7 / 840 G8 / 845 G8 owner** — see issues
   [#20](https://github.com/Popax21/synaTudor/issues/20) /
   [#40](https://github.com/Popax21/synaTudor/issues/40) (other non-`00be` PIDs).
 

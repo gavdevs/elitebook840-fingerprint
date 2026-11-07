@@ -1,60 +1,118 @@
-# EliteBook 840 G8 Fingerprint on Linux (Synaptics `06cb:00f0`)
+# HP EliteBook fingerprint on Linux — Synaptics secure sensors (`06cb:00df`, `06cb:00f0`)
 
-Getting the **Synaptics FS7605 "PurePrint" fingerprint sensor** (`06cb:00f0`) working
-on Linux in an **HP EliteBook 840 G8** (also 845 G8), running Kubuntu / Ubuntu 26.04.
+Getting a **secure (match-in-sensor) Synaptics fingerprint reader** working on Linux
+by relinking the real Windows driver with [synaTudor](https://github.com/Popax21/synaTudor).
 
-This repo captures everything from that effort: a **working fix** for one real
-problem, a **~90%-complete reverse-engineering port** for the hard problem, and a
-full write-up so anyone (future me included) can continue.
-
----
-
-## TL;DR — current status
-
-| Track | Status |
-|---|---|
-| **USB autosuspend fix** (sensor kept getting put to sleep) | ✅ **Working** — see [`scripts/99-fingerprint-no-autosuspend.rules`](scripts/99-fingerprint-no-autosuspend.rules) |
-| **Actual enrollment via the open `libfprint` driver** | ❌ Dead end — this firmware needs a *secure* enroll the open driver can't do (`Enrollment failed (104)` = `BMKT_OUT_OF_MEMORY`) |
-| **Running the real Windows driver via [synaTudor](https://github.com/Popax21/synaTudor)** | 🟡 **~90%** — driver loads, **pairs, brings up the TLS channel, and reads the sensor's secure DB**; blocked on a stale secure-DB record |
-
-Full story: [`CHANGELOG.md`](CHANGELOG.md) · deep technical detail: [`docs/FINDINGS.md`](docs/FINDINGS.md) · credit to the projects that made this possible: [`docs/ACKNOWLEDGMENTS.md`](docs/ACKNOWLEDGMENTS.md).
+**Status: working on the EliteBook 830 G7 (`06cb:00df`)** under Omarchy/Arch —
+sensor → Tudor host → libfprint TOD module → fprintd → `sudo`, polkit, and the lock
+screen. See [Working stack](#working-stack-06cb00df) for reproduction.
 
 ---
 
-## The device
+## TL;DR
 
-- **Sensor:** Synaptics FS7605 Touch Fingerprint Sensor w/ PurePrint, USB `06cb:00f0`
-- **Class:** "Synaptics UWP WBDI" — a **secure / match-in-sensor** sensor (Windows Hello style), firmware **v10.1** (build `3273255`, latest on LVFS)
-- **Laptop:** HP EliteBook 840 G8 (and 845 G8), Kubuntu / Ubuntu 26.04, kernel 7.0
+| Track | Sensor | Status |
+|---|---|---|
+| **TOD enrollment + auth** | `06cb:00df` | ✅ **Working** — enroll, verify, `sudo`/polkit/lock via PAM |
+| USB autosuspend | `06cb:00f0` | ✅ [rule](scripts/99-fingerprint-no-autosuspend.rules) (not installed) |
+| Open libfprint driver enroll | `06cb:00f0` | ❌ Dead end — firmware needs a secure enroll (`104` = `BMKT_OUT_OF_MEMORY`) |
+| TOD enroll | `06cb:00f0` | 🟡 Driver loads, pairs, TLS up, reads DB2; blocked on a stale DB2 record |
 
-Two independent on-sensor storage areas matter here:
-- the **bmkt** DB the open libfprint driver sees (BIOS "fingerprint reset" clears this), and
-- the **tudor DB2** secure store (126 user slots) the *secure* driver uses — **not** cleared by BIOS reset.
+Deep detail: [`docs/FINDINGS.md`](docs/FINDINGS.md) · history: [`CHANGELOG.md`](CHANGELOG.md) · credits: [`docs/ACKNOWLEDGMENTS.md`](docs/ACKNOWLEDGMENTS.md).
 
 ---
 
-## Quick start
+## Working stack (`06cb:00df`)
 
-### 1. The autosuspend fix (independent, recommended regardless)
-The sensor is put into USB autosuspend after 2 s; its first reply then comes back
-garbled. Install the rule to keep it awake:
-```bash
-sudo cp scripts/99-fingerprint-no-autosuspend.rules /etc/udev/rules.d/
-sudo udevadm control --reload-rules && sudo udevadm trigger
+Verified end-to-end on an HP EliteBook 830 G7 running Omarchy (Arch, fprintd 1.94.5).
+
+```
+fprintd ──► libtudor_tod.so (libfprint TOD module)
+              └─ D-Bus ──► tudor_host_launcher (root)
+                             └─ tudor_host ──► HP "110" WBDI DLL ──► USB 06cb:00df
 ```
 
-### 2. Build the synaTudor HP-110 port
-```bash
-# install build deps (see setup.sh header), then:
-./setup.sh
-```
-This clones synaTudor at the pinned base commit, applies [`patches/synaTudor-hp110.patch`](patches),
-fetches the HP driver DLLs ([`scripts/fetch-hp-driver.sh`](scripts/fetch-hp-driver.sh)), and builds.
+### Build and install
 
-### 3. Run the CLI test
 ```bash
-sudo bash scripts/syna-cli.sh      # press 'y'; menu: e=enroll i=identify q=query w=wipe
+./setup.sh                                  # clone base + apply patch + build + run offline tests
+sudo bash scripts/install-tudor-stack.sh    # binaries, TOD module, unit, D-Bus, udev rule
+sudo omarchy setup security fingerprint     # enroll right index; writes PAM for sudo/polkit/lock
 ```
+
+`./setup.sh` applies [`patches/synaTudor-hp110-storage-ipc.patch`](patches/synaTudor-hp110-storage-ipc.patch) to
+synaTudor at `31dfdb0` and builds `libtudor`, `tudor_host`, `tudor_host_launcher`,
+`tudor_cli`, and `libtudor_tod.so`. The patch is self-contained: a clean checkout
+builds and passes all 8 offline tests.
+
+`fprintd` needs a `libfprint` that supports TOD modules. `packaging/` holds the two
+PKGBUILDs used here (`libfprint-tod`, plus a `libfprint-git-compat` shim so the
+`libfprint-git` dependency Omarchy pins is satisfied). No proprietary binary is
+committed; the HP DLLs are fetched from HP's SoftPaq by
+[`scripts/fetch-hp-driver.sh`](scripts/fetch-hp-driver.sh) into git-ignored `work/`.
+
+### What the patch adds
+
+- **HP "110" driver support** — ID tables (`00be`/`00f0`/`00df`), DLL paths, and the
+  Windows APIs the 110 driver needs that upstream's 104-tuned shim lacked:
+  `GetSystemFirmwareTable` (SMBIOS host identity), `CallNtPowerInformation`,
+  USER32 window layer, WTS session notifications, CAPI AES/RSA (`CryptEncrypt`,
+  `CryptSetKeyParam`, …), `GetLocalTime`, `LoadLibraryW`.
+- **Vendor sensor storage** — `WinBio` storage adapter calls (`OpenDatabase`,
+  `QueryByContent`, `FirstRecord`/`NextRecord`, `CommitEnrollment`, `DeleteRecord`,
+  `EraseDatabase`), identity GUID + finger tracking, and capture retry bounds.
+- **IPC error reporting** — the host reports defined failures (duplicate finger,
+  failed commit, dead capture) as `IPC_MSG_RESP_ERROR` instead of `abort()`ing and
+  killing the device session. Without this a duplicate enroll killed `fprintd`.
+- **TOD record listing** — `IPC_MSG_RESP_LIST_RECORDS` lets the module enumerate
+  on-sensor records, so records created outside the current process can be listed
+  and deleted.
+- **WDF teardown fix** — unlinking a WDF object whose parent is already dead no
+  longer deadlocks.
+- **Install fixes** — launcher unit uses `/usr/bin/tudor` (was `/sbin`), and the
+  udev rule goes to `rules.d` (meson's `udevdir` points one level too high, which
+  left an inert rule in `/usr/lib/udev`).
+
+### Two gotchas that cost the most time
+
+1. **"Enrollment failed" on a sensor that already holds that finger.** The vendor
+   DB query API cannot enumerate every record. A leftover right-index template makes
+   every new right-index enroll fail as `enroll-duplicate`, and `fprintd`'s
+   `DeleteEnrolledFingers` removes only records it can see (`Deleted 0 records`).
+   Fix: erase the whole sensor DB with `tudor_cli` (`d`, then `ERASE`) as root,
+   with `TUDOR_DB_ERASE_APPROVED=1`; then restart the launcher.
+2. **`ObjectPathInUse: A host for this USB device already exists`.** After a crashed
+   enrollment the launcher keeps a stale host object and `fprintd` refuses the
+   device. Restart `tudor-host-launcher` (which also drops `fprintd`'s claim), then
+   `fprintd`.
+
+### Firmware-write boundary
+
+`tudor_open` reaches the proprietary driver's hardware-preparation code before the
+CLI regains control, so any run of the vendor stack can issue firmware/ownership
+writes. The approval-gated wrappers (`scripts/syna-cli.sh`,
+`scripts/syna-enroll-verify.sh`) require `TUDOR_FIRMWARE_WRITE_APPROVED=1`; that
+records approval, it does not prevent writes. See
+[`docs/FINDINGS.md`](docs/FINDINGS.md) §8.
+
+---
+
+## The `06cb:00f0` track (EliteBook 840/845 G8)
+
+- **Sensor:** Synaptics FS7605 PurePrint, USB `06cb:00f0`, firmware v10.1 (latest on LVFS)
+- The open libfprint `synaptics` driver talks to it but cannot drive its secure
+  enroll: `Enrollment failed (104)` = `BMKT_OUT_OF_MEMORY`, raised ~4 ms after
+  `ENROLL_READY`, before any touch. The bmkt DB is empty (proved with
+  [`patches/libfprint-synaptics-diag.patch`](patches/libfprint-synaptics-diag.patch));
+  the firmware speaks a newer protocol revision than the driver expects.
+- The TOD route gets further — driver init, pairing, TLS secure channel, and DB2
+  reads all work — but the closed driver loops during its own DB2 enumeration on a
+  lone stale record (`_GetCommonPropUsrObjId failed(118)` /
+  `stiTudorGetNextEnrollment() failed`), so `tudor_open` never returns.
+
+The database-wide erase in `tudor_cli` (command `d`) exists precisely to clear
+records that enumeration cannot see; that is what unblocked `00df`. It is the first
+thing to try on a `00f0` unit with a stale DB2 entry.
 
 ---
 
@@ -62,40 +120,37 @@ sudo bash scripts/syna-cli.sh      # press 'y'; menu: e=enroll i=identify q=quer
 
 ```
 .
-├── README.md                 # this file
-├── CHANGELOG.md              # chronological account of the whole effort
-├── setup.sh                  # reproduce the build from a clean checkout
+├── README.md
+├── CHANGELOG.md
+├── setup.sh                    # clone + patch + build + offline tests (no system changes)
 ├── patches/
-│   ├── synaTudor-hp110.patch          # our port: HP "110" driver support + ~10 Win-API shims
-│   └── libfprint-synaptics-diag.patch # diagnostic patch used to prove root causes
+│   ├── synaTudor-hp110-storage-ipc.patch  # HP 110 shims, vendor storage, IPC errors, TOD listing
+│   └── libfprint-synaptics-diag.patch # diagnostic patch used to prove the 00f0 root cause
 ├── scripts/
-│   ├── 99-fingerprint-no-autosuspend.rules   # ✅ the working autosuspend fix
-│   ├── fetch-hp-driver.sh     # download + extract the HP "110" DLLs (proprietary; not in git)
-│   ├── syna-cli.sh            # run the synaTudor CLI against 06cb:00f0
-│   └── fp-test.sh, fp-debug-on.sh, fp-debug-off.sh   # libfprint diagnostics
+│   ├── fetch-hp-driver.sh      # download + extract HP "110" DLLs (proprietary; not in git)
+│   ├── install-tudor-stack.sh  # install binaries, TOD module, unit, D-Bus, udev rule
+│   ├── syna-erase-db.sh        # root: erase the whole sensor DB (approval-gated)
+│   ├── syna-cli.sh             # gated, bounded open-only probe
+│   ├── syna-enroll-verify.sh   # gated single enroll + verify through tudor_cli
+│   ├── syna-verify-fresh.sh    # gated read-only verify against existing records
+│   ├── syna-inspect-vendor.sh  # vendor storage inspection
+│   └── 99-fingerprint-no-autosuspend.rules, fp-*.sh   # original 00f0 diagnostics
+├── packaging/
+│   ├── libfprint-tod-PKGBUILD, libfprint-git-compat-PKGBUILD
+│   ├── 60-tudor-libfprint-tod.rules
+│   └── net.reactivated.TudorHostLauncher.service
 ├── docs/
-│   ├── FINDINGS.md            # deep technical findings
-│   └── ACKNOWLEDGMENTS.md     # the upstream repos/drivers that got us here
-└── work/   (git-ignored)      # live build tree (synaTudor clone + build + HP DLLs)
+│   ├── FINDINGS.md
+│   └── ACKNOWLEDGMENTS.md
+├── work/   (git-ignored)       # synaTudor clone + build + HP DLLs
+└── state/  (git-ignored)       # host pairing store and logs
 ```
-
-> **No proprietary binaries are committed.** The HP/Synaptics driver DLLs are
-> fetched on demand from HP's public SoftPaq and live only under git-ignored `work/`.
 
 ---
 
-## Where it's blocked (the last 10%)
-
-The HP driver runs on Linux and reaches its **own** secure-DB enumeration during
-device bring-up, where it chokes on a leftover record
-(`NumCurrentUsers=1` / `_GetCommonPropUsrObjId failed(118)`) and loops, so
-`tudor_open` never completes. That loop is **inside the closed driver blob**, and
-clearing the record needs the menu, which needs open to finish — a catch-22.
-See [`docs/FINDINGS.md`](docs/FINDINGS.md) → *The wall* and *Ways forward*.
-
 ## Credits
 
-Built entirely on the shoulders of open-source RE work — see
+Built entirely on open-source reverse-engineering — see
 [`docs/ACKNOWLEDGMENTS.md`](docs/ACKNOWLEDGMENTS.md). Especially
-**[Popax21/synaTudor](https://github.com/Popax21/synaTudor)** (the driver-relinking
-framework) and **[uunicorn](https://github.com/uunicorn/synaWudfBioUsb-sandbox)**.
+**[Popax21/synaTudor](https://github.com/Popax21/synaTudor)** and
+**[uunicorn/synaWudfBioUsb-sandbox](https://github.com/uunicorn/synaWudfBioUsb-sandbox)**.

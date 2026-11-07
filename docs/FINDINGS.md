@@ -116,6 +116,108 @@ stiTudorGetNextEnrollment() failed
 
 ## Reproduce / continue
 
-`./setup.sh` (deps in its header), then `sudo bash scripts/syna-cli.sh`.
-Debug loop: build is `-DDBGIMPORT=true`; read crashes with
-`coredumpctl info <pid>`; live log at `/tmp/syna-cli.log`.
+`./setup.sh` (deps in its header) prepares the build only. The local `00df` wrapper
+is deliberately approval-gated; see below. Debug builds use `-DDBGIMPORT=true`.
+Crash analysis with `coredumpctl info <pid>` is host-side and optional.
+
+## 8. EliteBook 830 G7 (`00df`) open-only preparation and firmware boundary
+
+`patches/synaTudor-hp110-storage-ipc.patch` adds the package-listed `06cb:00df` ID and an
+environment-controlled exit after successful `tudor_open` (`TUDOR_OPEN_ONLY=1`). The
+CLI then saves its local pairing data and closes normally without accepting post-open
+commands. The wrapper uses `state/tudor-store`, not a prior developer's home
+directory. That open-only guard is only relevant to the probe wrapper; the working
+stack (section 9) runs the same code path with post-open commands enabled.
+
+This guard is **not** a firmware-update guard. `tudor_open` calls the proprietary
+HP DLL's hardware-preparation and pipeline initialization before returning. Those
+DLLs can issue arbitrary control/bulk writes; the open-source USB layer does not
+classify them as reads, pairing, DB2 mutation, SBL entry, or image download. The
+native registry state includes `DeviceUpdateInProcess`,
+`updateFirmwareFailureCount`, and `LastUpdateSystemTimeStamp`. Together with the
+observed ownership-change reflash note and repeated SBL checks, that makes firmware
+writes reachable during the first open. Static source evidence does not establish
+that a particular attempt actually completed a reflash.
+
+No disable flag was found in the CLI, HP patch, native DLL environment, or registry
+state. `TUDOR_OPEN_ONLY` and `SYNA_USB_TIMEOUT` respectively suppress post-open CLI
+commands and clamp waits; neither filters outbound USB writes. A protocol-aware
+write guard validated on an offline/mock transport, or a precisely identified DLL
+update-branch patch, is required before calling this firmware-safe. The wrapper's
+`TUDOR_FIRMWARE_WRITE_APPROVED=1` check is only an approval gate, not a technical
+prevention mechanism.
+
+For log triage, the useful markers are:
+- secure channel activity: `ssiTlsWrap`, successful `ssiTlsUnwrap`, and
+  `palCryptoEncryptAuth` / `palCryptoDecryptAuth`;
+- secure DB2 reads: `VCSFW_CMD_DB2_GET_DB_INFO`, a response containing
+  `NumCurrentUsers=`, and `VCSFW_CMD_DB2_GET_OBJECT_LIST`;
+- complete host-side open-only success: `Open-only test succeeded; skipping all
+  post-open sensor commands` followed by `Saving data to data store`;
+- the known unresolved DB2 enumeration defect: `_GetCommonPropUsrObjId failed(118)`
+  and `stiTudorGetNextEnrollment() failed`, especially when followed by another
+  pairing/SBL/open cycle. DB2 reads before these lines do not mean open completed.
+
+`TLS context is not initialized` and `palCrypto: Output buffer too small` are not by
+themselves failures when the subsequent unwrap/size retry succeeds.
+
+## 9. Why `00df` works and where enrollment actually fails
+
+The `00df` sensor completes the same secure path that `00f0` stalls in: driver init,
+pairing, TLS, DB2 access. The difference is the state of the sensor's own database,
+not the driver.
+
+### The duplicate-enrollment trap
+
+`WinBioEnrollCommit` refuses a finger that already has a record and the vendor
+framework then discards the pending enrollment. The old host-side code turned that
+into `abort()`, which killed `tudor_host` mid-session; `fprintd` saw a dead IPC peer
+and segfaulted. The logs looked like a crash, not a duplicate:
+
+```
+Enrollment of GUID 9fcfd7fb... finger 2 is a duplicate - discarding
+Reported IPC error code 1 to the module
+fprintd.service: Main process exited, code=dumped, status=11/SEGV
+Failed to start Tudor host process ... ObjectPathInUse: A host for this USB device already exists
+```
+
+After the patch the same condition surfaces as a normal fprintd error
+(`FP_DEVICE_ERROR_DATA_DUPLICATE`) and the device stays usable.
+
+### The record the query API cannot see
+
+The critical asymmetry:
+
+| Operation | Scope |
+|---|---|
+| `QueryByContent` / `FirstRecord` / `NextRecord` | records the vendor DB links normally |
+| `DeleteEnrolledFingers` (fprintd) | only records exposed by that query |
+| `EraseDatabase` (adapter interface) | **entire** database, linked or not |
+
+A record can exist, answer identify (`Identify result -> matches GUID 00000001...`),
+and still be invisible to enumeration. Observed symptoms of exactly that state:
+
+```
+[INF] Cleared 0 records
+[INF] Identify result -> matches GUID 00000001... finger 2
+[INF] Deleted 0 records with GUID 00000001... finger 2
+[WRN] Enrollment of GUID <new>... finger 2 is a duplicate - discarding
+```
+
+So fprintd reports "no fingers enrolled", every new enrollment of that finger is
+rejected as a duplicate, and no amount of `fprintd-delete` clears it. Only
+`EraseDatabase` does, and it needs the vendor adapter from `tudor_cli`.
+
+### Current gaps in the TOD module worth closing
+
+- Enrollment records created on the sensor have `record size 0`: the template lives
+  in sensor flash and the host stores identity only
+  (`Committed enrollment ... no host side record data`). `EraseDatabase` is
+  therefore destructive and unrecoverable by design.
+- `tudor-host-launcher` keeps a host object per USB device. A crashed session leaves
+  it behind, and every later `fprintd` start fails with `ObjectPathInUse` until the
+  launcher is restarted. Making the launcher reap a dead host's object, or keying it
+  on the current `fprintd` connection, would remove a manual restart.
+- `EraseDatabase` tears down the adapter's DB session; the driver must be reopened
+  before the database is usable again. Any future in-process caller has to reload
+  the device rather than continuing.

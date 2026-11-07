@@ -1,0 +1,9 @@
+# synaTudor Tudor TOD driver: match the Synaptics sensors the HP "110" driver
+# supports. libfprint's own 70-libfprint-2.rules has no entry for these, so the
+# TOD module only gets picked for devices tagged here.
+#
+# Group "plugdev" does not exist on Arch; use uaccess (systemd-logind) so the
+# logged-in owner gets access without a group, matching libfprint's convention.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="06cb", ATTRS{idProduct}=="00be", ENV{LIBFPRINT_DRIVER}="Tudor TOD", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="06cb", ATTRS{idProduct}=="00f0", ENV{LIBFPRINT_DRIVER}="Tudor TOD", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="06cb", ATTRS{idProduct}=="00df", ENV{LIBFPRINT_DRIVER}="Tudor TOD", TAG+="uaccess"

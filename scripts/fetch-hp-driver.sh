@@ -7,7 +7,7 @@
 #   DEST defaults to work/synaTudor/libtudor/hpdrv (where the patched
 #   download_driver.sh expects them).
 #
-# Requires: wget, innoextract
+# Requires: wget, cabextract
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DEST="${1:-$REPO_DIR/work/synaTudor/libtudor/hpdrv}"
@@ -16,7 +16,7 @@ DEST="${1:-$REPO_DIR/work/synaTudor/libtudor/hpdrv}"
 # INF (synaWudfBioUsbUwp.inf) lists USB\VID_06CB&PID_00C0/C4/D8/DF/E9/F0.
 URL="https://ftp.hp.com/pub/softpaq/sp111001-111500/sp111238.exe"
 
-command -v innoextract >/dev/null || { echo "ERROR: install innoextract"; exit 1; }
+command -v cabextract >/dev/null || { echo "ERROR: install cabextract"; exit 1; }
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -24,12 +24,13 @@ trap 'rm -rf "$TMP"' EXIT
 echo "Downloading HP driver ($URL)..."
 wget -q "$URL" -O "$TMP/sp.exe"
 
-echo "Extracting with innoextract..."
-innoextract -s -d "$TMP/x" "$TMP/sp.exe" >/dev/null 2>&1 || innoextract -d "$TMP/x" "$TMP/sp.exe" >/dev/null
+echo "Extracting the HP Softpaq CAB payload..."
+mkdir -p "$TMP/x"
+cabextract -q -d "$TMP/x" "$TMP/sp.exe"
 
 mkdir -p "$DEST"
-cp "$(find "$TMP/x" -iname synaFpAdapter110.dll  | head -1)" "$DEST/synaFpAdapter110.dll"
-cp "$(find "$TMP/x" -iname synaWudfBioUsb110.dll | head -1)" "$DEST/synaWudfBioUsb110.dll"
+cp "$TMP/x/src/driver/INF/x64/synaFpAdapter110.dll" "$DEST/synaFpAdapter110.dll"
+cp "$TMP/x/src/driver/INF/x64/synaWudfBioUsb110.dll" "$DEST/synaWudfBioUsb110.dll"
 
 echo "Staged into $DEST:"
 ls -la "$DEST"

@@ -1,15 +1,15 @@
 #!/bin/bash -e
-# Reproduce the synaTudor HP-110 build from a clean checkout:
+# Reproduce the working 06cb:00df Synaptics Tudor stack:
 #   1. clone synaTudor at the pinned base commit
-#   2. apply our HP-110 port patch
+#   2. apply patches/synaTudor-hp110-storage-ipc.patch (HP "110" support, Win-API shims,
+#      vendor sensor storage, IPC error reporting, TOD record listing)
 #   3. fetch + stage the HP "110" driver DLLs
-#   4. build (libtudor + tudor_cli) with import debugging on
+#   4. build libtudor, tudor_host, tudor_host_launcher, tudor_cli, libtudor_tod.so
 #
-# Build deps (Debian/Ubuntu):
-#   sudo apt install -y build-essential meson ninja-build pkg-config \
-#       libglib2.0-dev libgusb-dev libudev-dev libssl-dev libusb-1.0-0-dev \
-#       libjson-glib-dev libcap-dev libseccomp-dev libdbus-1-dev \
-#       libfprint-2-tod-dev innoextract
+# This does not touch the system. Install with scripts/install-tudor-stack.sh.
+#
+# Build deps (Arch): base-devel meson ninja pkgconf glib2 libgusb systemd-libs
+#   openssl libusb json-glib libcap libseccomp dbus innoextract
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORK="$REPO_DIR/work"
@@ -21,15 +21,17 @@ if [ ! -d "$SYNA/.git" ]; then
     git clone https://github.com/Popax21/synaTudor.git "$SYNA"
 fi
 cd "$SYNA"
-git checkout "$SYNA_BASE_COMMIT"
-git apply --reject "$REPO_DIR/patches/synaTudor-hp110.patch" || \
-    echo "NOTE: patch may already be applied (check for *.rej)"
+# Start from the pristine pinned base so a re-run never stacks patches twice.
+git checkout -f "$SYNA_BASE_COMMIT"
+git clean -fdq -e build -e hpdrv
+git apply "$REPO_DIR/patches/synaTudor-hp110-storage-ipc.patch"
 
 bash "$REPO_DIR/scripts/fetch-hp-driver.sh" "$SYNA/libtudor/hpdrv"
 
 rm -rf build
 meson setup build -DDBGIMPORT=true
 ninja -C build
+meson test -C build --print-errorlogs
 echo
-echo "Built: $SYNA/build/cli/tudor_cli"
-echo "Run:   sudo bash $REPO_DIR/scripts/syna-cli.sh"
+echo "Built:   $SYNA/build/cli/tudor_cli"
+echo "Install: sudo bash $REPO_DIR/scripts/install-tudor-stack.sh"

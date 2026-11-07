@@ -1,6 +1,7 @@
 # Live build tree (regenerable via setup.sh) — keeps the heavy upstream clone,
 # build artifacts, and proprietary driver DLLs out of git.
 work/
+state/
 
 # Proprietary HP/Synaptics driver blobs (fetched on demand, never committed)
 *.dll
