@@ -1,3 +1,14 @@
+diff --git a/.gitignore b/.gitignore
+index c795b05..660e697 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1 +1,4 @@
+-build
+\ No newline at end of file
++buildbuild
++hpdrv/
++libtudor/hpdrv/
++*.dll
 diff --git a/cli/src/cli.c b/cli/src/cli.c
 index 0edc8ef..292c265 100644
 --- a/cli/src/cli.c
