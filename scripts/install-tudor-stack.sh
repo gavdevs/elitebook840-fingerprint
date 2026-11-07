@@ -8,7 +8,7 @@
 # Run after ./setup.sh has built work/synaTudor/build.
 set -euo pipefail
 
-REPO="$(cd "$(dirname "$0")" && pwd)"
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SYNA="$REPO/work/synaTudor"
 BUILD="$SYNA/build"
 

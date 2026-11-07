@@ -815,7 +815,7 @@ index 4450786..3a18f84 100644
 +cp "$HP/synaFpAdapter110.dll"  "$OUT_DIR/synaFpAdapter104.dll"
 +cp "$HP/synaWudfBioUsb110.dll" "$OUT_DIR/synaWudfBioUsb104.dll"
 diff --git a/libtudor/inc/tudor/tudor.h b/libtudor/inc/tudor/tudor.h
-index 56b532c..9d2349d 100644
+index 56b532c..b15ff5f 100644
 --- a/libtudor/inc/tudor/tudor.h
 +++ b/libtudor/inc/tudor/tudor.h
 @@ -66,6 +66,13 @@ struct tudor_record {
@@ -841,7 +841,7 @@ index 56b532c..9d2349d 100644
  
      //Enroll data
      bool enrolling;
-@@ -105,4 +114,30 @@ bool tudor_enroll_discard(struct tudor_device *device);
+@@ -105,4 +114,33 @@ bool tudor_enroll_discard(struct tudor_device *device);
  bool tudor_verify(struct tudor_device *device, RECGUID guid, enum tudor_finger finger, bool *retry, bool *matches, tudor_async_res_t *res);
  bool tudor_identify(struct tudor_device *device, bool *retry, bool *found_match, RECGUID *guid, enum tudor_finger *finger, tudor_async_res_t *res);
  
@@ -854,6 +854,9 @@ index 56b532c..9d2349d 100644
 +
 +//Enumerate/deletes through the configured storage adapter (host list or sensor DB).
 +int tudor_storage_get_records(struct tudor_device *device, struct tudor_stored_record *records, int max_records);
++//Counts enrollments matching a GUID/finger filter in the active storage backend.
++//Returns -1 when enumeration fails, so callers can tell "none left" from "unknown".
++int tudor_storage_count_matching_records(struct tudor_device *device, RECGUID *guid, enum tudor_finger finger);
 +bool tudor_storage_delete_records(struct tudor_device *device, RECGUID *guid, enum tudor_finger finger);
 +
 +//Turns TUDOR_FINGER_ANY into a concrete enrolled finger for that identity, the way
@@ -887,7 +890,7 @@ index 37b076a..b7cee30 100644
      'src/winapi/crypt/rsa_aes.c',
      'src/winapi/crypt/evp_digest.c',
 diff --git a/libtudor/src/tudor/device.c b/libtudor/src/tudor/device.c
-index 48f4352..ff4c93e 100644
+index 48f4352..2837688 100644
 --- a/libtudor/src/tudor/device.c
 +++ b/libtudor/src/tudor/device.c
 @@ -1,6 +1,35 @@
@@ -1134,7 +1137,7 @@ index 48f4352..ff4c93e 100644
      log_debug("Capturing sample...");
      OVERLAPPED *ovlp;
      WINBIO_CALL_PIPELINE(tudor_sensor_adapter->StartCapture, device->pipeline, WINBIO_PURPOSE_VERIFY, &ovlp);
-@@ -474,4 +586,99 @@ bool tudor_identify(struct tudor_device *device, bool *retry, bool *found_match,
+@@ -474,4 +586,140 @@ bool tudor_identify(struct tudor_device *device, bool *retry, bool *found_match,
      (*res)->args.identify = (struct async_args_identify) { .retry = retry, .found_match = found_match, .guid = guid, .finger = finger };
      winio_set_overlapped_callback(ovlp, (winio_overlapped_cb_fnc*) identify_cb, *res, true);
      return true;
@@ -1203,13 +1206,38 @@ index 48f4352..ff4c93e 100644
 +        return false;
 +    }
 +
-+    //The adapter tears the database session down as part of the erase (the
-+    //reopen path reports 0x80098015 in the offline adapter harness), so remember
-+    //it and skip CloseDatabase on the way out. The caller has to restart the
-+    //driver to get a usable (empty) database back.
++    //The adapter tears the database session down as part of the erase, so the
++    //handle cannot be closed afterwards. Try to open a fresh session right away:
++    //when that works the device stays usable after a clear, which is what
++    //libfprint's clear_storage needs. When it fails, storage_erased stays set and
++    //the caller has to restart the driver to get a usable (empty) database back.
 +    device->storage_erased = true;
-+    log_warn("Erased the %s storage database; restart the driver to reopen it", device->sensor_storage ? "sensor" : "host");
++    log_warn("Erased the %s storage database", device->sensor_storage ? "sensor" : "host");
++
++    if(storage->OpenDatabase && storage->OpenDatabase(device->pipeline, &sensor_db_id, u"", u"") == ERROR_SUCCESS) {
++        device->storage_erased = false;
++        log_info("Reopened the storage database after erasing it");
++    } else {
++        log_warn("Could not reopen the storage database; the driver must be restarted to use it again");
++    }
++
 +    return true;
++}
++
++int tudor_storage_count_matching_records(struct tudor_device *device, RECGUID *guid, enum tudor_finger finger) {
++    struct tudor_stored_record records[128];
++    int num_records = tudor_storage_get_records(device, records, 128);
++    if(num_records < 0) return -1;
++    if(num_records > 128) num_records = 128;
++
++    int matched = 0;
++    for(int i = 0; i < num_records; i++) {
++        if(guid && memcmp(&records[i].guid, guid, sizeof(RECGUID)) != 0) continue;
++        if(finger != TUDOR_FINGER_ANY && records[i].finger != finger) continue;
++        matched++;
++    }
++
++    return matched;
 +}
 +
 +bool tudor_storage_delete_records(struct tudor_device *device, RECGUID *guid, enum tudor_finger finger) {
@@ -1232,6 +1260,22 @@ index 48f4352..ff4c93e 100644
 +    if(hres != ERROR_SUCCESS) {
 +        log_error("Error deleting %s storage record: 0x%x!", device->sensor_storage ? "sensor" : "host", hres);
 +        return false;
++    }
++
++    //The vendor adapter answers ERROR_SUCCESS without removing anything when the
++    //template is not linked into its queryable database. Observed on 06cb:00df as
++    //"Deleted 0 records with GUID ..." immediately followed by a successful
++    //identify of that same GUID. Reporting success there makes fprintd tell the
++    //user the fingerprint is gone while it stays enrolled on the sensor, so the
++    //only honest answer is to check and fail when the record survived.
++    if(device->sensor_storage) {
++        int remaining = tudor_storage_count_matching_records(device, guid, finger);
++        if(remaining < 0) {
++            log_warn("Couldn't verify the sensor record deletion: enumeration failed");
++        } else if(remaining > 0) {
++            log_error("Storage adapter reported success but %d matching record(s) remain; deletion did not take effect", remaining);
++            return false;
++        }
 +    }
 +
 +    return true;
@@ -4113,7 +4157,7 @@ index 2de02d3..3bcee50 100644
  #endif
 \ No newline at end of file
 diff --git a/tudor-host/src/handler.c b/tudor-host/src/handler.c
-index 0ae1d9a..eb8c6de 100644
+index 0ae1d9a..3ca151c 100644
 --- a/tudor-host/src/handler.c
 +++ b/tudor-host/src/handler.c
 @@ -39,6 +39,18 @@ static inline void send_ack(int ipc_sock) {
@@ -4315,24 +4359,23 @@ index 0ae1d9a..eb8c6de 100644
  
              //Send ACK
              send_ack(state->ipc_sock);
-@@ -332,8 +383,29 @@ static inline bool handle_msg(struct handler_state *state, enum ipc_msg_type typ
+@@ -331,9 +382,27 @@ static inline bool handle_msg(struct handler_state *state, enum ipc_msg_type typ
+             check_in_action(state, type);
              consume_simple_msg(state->ipc_sock, type);
  
-             //Wipe records
+-            //Wipe records
 -            int num_recs = tudor_wipe_records(state->dev, NULL, TUDOR_FINGER_ANY);
 -            log_info("Cleared %d records", num_recs);
++            //Clear the stored records. On the sensor backend, per-record deletion is
++            //not sufficient: the vendor adapter answers success for records its query
++            //API cannot link, so a "cleared" database can still hold a template and
++            //reject the next enrollment of that finger as a duplicate. EraseDatabase
++            //replaces the whole database, which removes those unlinked entries too;
++            //tudor_storage_erase_database then reopens the session so this device
++            //stays usable for the enrollment that clear_storage precedes.
 +            bool cleared = true;
 +            if(state->dev->sensor_storage) {
-+                struct tudor_stored_record records[IPC_MAX_LISTED_RECORDS];
-+                int num_records = tudor_storage_get_records(state->dev, records, IPC_MAX_LISTED_RECORDS);
-+                if(num_records < 0 || num_records > IPC_MAX_LISTED_RECORDS) {
-+                    log_error("Couldn't enumerate the sensor records to clear them (%d found, max %d)", num_records, IPC_MAX_LISTED_RECORDS);
-+                    cleared = false;
-+                } else {
-+                    for(int i = 0; i < num_records; i++) {
-+                        if(!tudor_storage_delete_records(state->dev, &records[i].guid, records[i].finger)) cleared = false;
-+                    }
-+                }
++                cleared = tudor_storage_erase_database(state->dev);
 +            } else {
 +                tudor_wipe_records(state->dev, NULL, TUDOR_FINGER_ANY);
 +            }
@@ -4347,7 +4390,7 @@ index 0ae1d9a..eb8c6de 100644
  
              //Send ACK
              send_ack(state->ipc_sock);
-@@ -354,13 +426,18 @@ static inline bool handle_msg(struct handler_state *state, enum ipc_msg_type typ
+@@ -354,13 +423,18 @@ static inline bool handle_msg(struct handler_state *state, enum ipc_msg_type typ
              //Start enrollment
              if(!tudor_enroll_start(state->dev, msg.guid, msg.finger)) {
                  log_error("Couldn't start enrollment!");
@@ -4368,7 +4411,7 @@ index 0ae1d9a..eb8c6de 100644
              }
              log_debug("Started enroll action");
              tudor_set_async_callback(state->async_res, (tudor_async_cb_fnc*) enroll_cb, state);
-@@ -384,7 +461,9 @@ static inline bool handle_msg(struct handler_state *state, enum ipc_msg_type typ
+@@ -384,7 +458,9 @@ static inline bool handle_msg(struct handler_state *state, enum ipc_msg_type typ
              //Start verify action
              if(!tudor_verify(state->dev, msg.guid, msg.finger, &state->action.verify.retry, &state->action.verify.matches, &state->async_res)) {
                  log_error("Couldn't start verify action!");
@@ -4379,7 +4422,7 @@ index 0ae1d9a..eb8c6de 100644
              }
              log_debug("Started verify action");
              tudor_set_async_callback(state->async_res, (tudor_async_cb_fnc*) verify_cb, state);
-@@ -403,7 +482,9 @@ static inline bool handle_msg(struct handler_state *state, enum ipc_msg_type typ
+@@ -403,7 +479,9 @@ static inline bool handle_msg(struct handler_state *state, enum ipc_msg_type typ
              //Start identify action
              if(!tudor_identify(state->dev, &state->action.identify.retry, &state->action.identify.has_match, &state->action.identify.guid, &state->action.identify.finger, &state->async_res)) {
                  log_error("Couldn't start identify action!");
@@ -4390,7 +4433,7 @@ index 0ae1d9a..eb8c6de 100644
              }
              log_debug("Started identify action");
              tudor_set_async_callback(state->async_res, (tudor_async_cb_fnc*) identify_cb, state);
-@@ -412,6 +493,45 @@ static inline bool handle_msg(struct handler_state *state, enum ipc_msg_type typ
+@@ -412,6 +490,45 @@ static inline bool handle_msg(struct handler_state *state, enum ipc_msg_type typ
              send_ack(state->ipc_sock);
          } break;
  

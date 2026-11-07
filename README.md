@@ -46,9 +46,11 @@ synaTudor at `31dfdb0` and builds `libtudor`, `tudor_host`, `tudor_host_launcher
 builds and passes all 8 offline tests.
 
 `fprintd` needs a `libfprint` that supports TOD modules. `packaging/` holds the two
-PKGBUILDs used here (`libfprint-tod`, plus a `libfprint-git-compat` shim so the
-`libfprint-git` dependency Omarchy pins is satisfied). No proprietary binary is
-committed; the HP DLLs are fetched from HP's SoftPaq by
+PKGBUILDs used here: `libfprint-tod`, and a stub literally *named* `libfprint-git`
+(epoch 1, no library) because Omarchy's setup checks that package name with
+`pacman -Q`, which does not resolve `provides=`, and the real `libfprint-git`
+conflicts with `libfprint-tod`. No proprietary binary is committed; the HP DLLs are
+fetched from HP's SoftPaq by
 [`scripts/fetch-hp-driver.sh`](scripts/fetch-hp-driver.sh) into git-ignored `work/`.
 
 ### What the patch adds
@@ -136,7 +138,7 @@ thing to try on a `00f0` unit with a stale DB2 entry.
 │   ├── syna-inspect-vendor.sh  # vendor storage inspection
 │   └── 99-fingerprint-no-autosuspend.rules, fp-*.sh   # original 00f0 diagnostics
 ├── packaging/
-│   ├── libfprint-tod-PKGBUILD, libfprint-git-compat-PKGBUILD
+│   ├── libfprint-tod-PKGBUILD, libfprint-git-PKGBUILD
 │   ├── 60-tudor-libfprint-tod.rules
 │   └── net.reactivated.TudorHostLauncher.service
 ├── docs/

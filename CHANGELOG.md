@@ -5,6 +5,37 @@ Format is narrative rather than release-versioned — this is a research log.
 
 ## [unreleased]
 
+### 2026-11-06 — Do not report a deletion the sensor did not perform
+- The vendor storage adapter answers `ERROR_SUCCESS` from `DeleteRecord` without
+  removing anything when the template is not linked into its queryable database.
+  Measured on `00df`: `Deleted 0 records with GUID 9367845f... finger 2`, then a
+  successful identify of that same GUID. `tudor_storage_delete_records` now counts
+  matching records after the call and fails when any remain, so fprintd surfaces
+  the truth instead of claiming the fingerprint is gone.
+- `IPC_MSG_CLEAR_RECORDS` now uses `EraseDatabase` on the sensor backend instead of
+  deleting enumerated records one by one. Per-record deletion can leave exactly the
+  unlinked template that makes the next enrollment of that finger fail as a
+  duplicate.
+- `tudor_storage_erase_database` reopens the DB session after erasing, so a clear
+  leaves the device usable for the enrollment that follows it rather than requiring
+  a driver restart.
+- Context: Omarchy's `omarchy-remove-security-fingerprint` calls `fprintd-delete`,
+  then drops `fprintd libfprint libfprint-git`, which deletes `/var/lib/fprint`.
+  With the old silent-success behavior that left a stale template on the sensor and
+  no host-side record, so the next enroll failed as a duplicate with nothing to
+  point at. The removal path now gets an error it can report.
+
+### 2026-11-06 — Packaging fixes found while installing
+- `scripts/install-tudor-stack.sh` resolved the repo root to `scripts/`, so from any
+  other working directory it looked for `scripts/work/synaTudor/build`. It now uses
+  the parent of its own directory.
+- `libfprint-git-compat` could not satisfy Omarchy's dependency check:
+  `omarchy-pkg-missing` uses `pacman -Q libfprint-git`, which does not resolve
+  `provides=`, so setup tried to install the real `libfprint-git` and hit its
+  conflict with `libfprint-tod`. `packaging/libfprint-git-PKGBUILD` is now a package
+  literally named `libfprint-git` (epoch 1, version above the omarchy repo build so
+  upgrades leave it alone) that depends on `libfprint-tod` and ships no library.
+
 ### 2026-11-06 — EliteBook 830 G7 (`06cb:00df`) WORKING end-to-end
 - The full chain now works on Omarchy/Arch: sensor → `tudor_host` → `libtudor_tod.so`
   → fprintd → `sudo`, polkit, and the lock screen. Right index enrolled and
