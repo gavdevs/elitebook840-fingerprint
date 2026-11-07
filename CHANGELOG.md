@@ -5,6 +5,24 @@ Format is narrative rather than release-versioned — this is a research log.
 
 ## [unreleased]
 
+### 2026-11-07 — Survive `omarchy remove fingerprint`
+- Root cause of the repeat breakage: Omarchy's removal runs `omarchy-pkg-drop
+  fprintd libfprint libfprint-git`, and setup's dependency check needs a package
+  actually *named* `libfprint-git` (`pacman -Q` does not resolve `provides=`).
+  A `provides=` stub satisfied the check but survived the drop, leaving a system
+  that claimed the name with `fprintd` gone; a stub named `libfprint-git` was
+  removed by the drop along with the real TOD library. The TOD build is now
+  packaged *as* `libfprint-git` (epoch 1, replaces `libfprint-tod`), so one
+  package owns the name and remove→setup is consistent.
+- `scripts/install-tudor-stack.sh` copied build artifacts with `install`, leaving
+  meson's build-tree rpath `$ORIGIN/../libtudor`. Installed binaries land flat in
+  `/usr/bin/tudor`, so `tudor_host` could not load `libtudor.so`; the launcher
+  died and fprintd reported `Ignoring device due to initialization error: Error
+  sending message: Connection refused`. Now installs via `meson install`, which
+  rewrites the runpath to `$ORIGIN`.
+- The launcher is `Type=dbus` with no `[Install]` section; `systemctl enable` on it
+  is wrong and was removed.
+
 ### 2026-11-06 — Do not report a deletion the sensor did not perform
 - The vendor storage adapter answers `ERROR_SUCCESS` from `DeleteRecord` without
   removing anything when the template is not linked into its queryable database.
