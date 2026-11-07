@@ -145,7 +145,7 @@ thing to try on a `00f0` unit with a stale DB2 entry.
 .
 ├── README.md
 ├── CHANGELOG.md
-├── setup.sh                    # clone + patch + build + offline tests (no system changes)
+├── setup.sh                    # clone fork branch + build + offline tests (no system changes)
 ├── patches/
 │   ├── synaTudor-hp110-storage-ipc.patch  # squashed snapshot of the fork branch (offline use)
 │   └── libfprint-synaptics-diag.patch # diagnostic patch used to prove the 00f0 root cause
