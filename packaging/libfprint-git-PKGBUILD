@@ -1,31 +1,75 @@
-# Stub package that satisfies both `pacman -Q libfprint-git` (what Omarchy's
-# omarchy-pkg-missing checks) and any dependency on the name libfprint-git,
-# while the actual library comes from libfprint-tod.
+# Maintainer: nezu <nezu@nezu.cc>
 #
-# Why a stub and not `provides=`: pacman -Q does not resolve provides, only
-# real package names, so omarchy-pkg-missing still reports libfprint-git
-# missing and then tries to install the omarchy repo build, which conflicts
-# with libfprint-tod.
+# This is a modified version of the libfprint PKGBUILD file from the official Arch Linux repositories
+
+# This build carries the NAME libfprint-git on purpose. Omarchy's fingerprint
+# setup needs a package actually named libfprint-git (omarchy-pkg-missing runs
+# `pacman -Q`, which does not resolve provides=), while
+# omarchy-remove-security-fingerprint drops exactly fprintd, libfprint and
+# libfprint-git. Shipping the TOD build under that name means the remove leaves
+# this package deleted and setup can reinstall it from this PKGBUILD, instead of
+# a separate `provides=` stub that pacman -Q cannot see and that the drop then
+# deletes anyway.
 #
-# The version is deliberately higher than the omarchy repo's
-# 1:1.94.100.r10.g6f9479c-5 so a system upgrade does not try to "upgrade"
-# this stub back into the conflicting real package.
+# The version sits above the omarchy repo's libfprint-git so a plain
+# `pacman -Syu` does not replace this TOD build with the stock one, which
+# conflicts with itself and does not carry the TOD driver interface.
 pkgname=libfprint-git
+_pkgdirname=libfprint
 pkgver=1.95.2+tod1
 pkgrel=1
 epoch=1
-pkgdesc="Stub: libfprint supplied by libfprint-tod (keeps Omarchy dependency checks satisfied)"
+pkgdesc="Library for fingerprint readers - TOD build (Omarchy libfprint-git name)"
+url="https://fprint.freedesktop.org/"
 arch=(x86_64)
-license=(none)
-depends=(libfprint-tod)
-options=(!strip)
-package() {
-  install -dm755 "$pkgdir/usr/share/doc/libfprint-git"
-  cat > "$pkgdir/usr/share/doc/libfprint-git/README" <<'TXT'
-libfprint is provided by libfprint-tod on this system.
+license=(LGPL-2.1-or-later)
+depends=(
+  gcc-libs
+  glib2
+  glibc
+  libgudev
+  libgusb
+  nss
+  pixman
+)
+makedepends=(
+  git
+  glib2-devel
+  gobject-introspection
+  gtk-doc
+  meson
+  python-cairo
+  python-gobject
+  systemd
+)
+checkdepends=(
+  cairo
+  umockdev
+)
+# Provide libfprint for compatibility with fprintd and also provide libfprint-tod for tod-style-only drivers
+provides=(libfprint libfprint-tod libfprint-2.so libfprint-2-tod.so)
+conflicts=(libfprint libfprint-tod)
+groups=(fprint)
+replaces=(libfprint-tod)
+source=("git+https://gitlab.freedesktop.org/3v1n0/libfprint.git?signed#tag=v$pkgver")
+b2sums=('7409a4fb2de8dc03c8829f2c6fecd14484ca880bf6860ac6948bc2186f989077ae4316bfd4e077d0f3b9127f98fbdac8915e034b4958fdb363c31e51897359d1')
+validpgpkeys=(
+  D4C501DA48EB797A081750939449C2F50996635F # Marco Trevisan (Treviño) <mail@3v1n0.net>
+)
+options=('!lto')
 
-This package exists only so that `pacman -Q libfprint-git` succeeds: Omarchy's
-fingerprint setup checks that exact package name (pacman -Q does not resolve
-provides), and installing the real libfprint-git conflicts with libfprint-tod.
-TXT
+build() {
+  local meson_options=(
+    # Add virtual drivers for integration tests (e.g. in fprintd)
+    -D drivers=all
+
+    -D installed-tests=false
+  )
+
+  arch-meson $_pkgdirname build "${meson_options[@]}"
+  meson compile -C build
+}
+
+package() {
+  meson install -C build --destdir "$pkgdir"
 }

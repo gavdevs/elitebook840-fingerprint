@@ -22,11 +22,15 @@ if [ ! -d "$BUILD" ]; then
 fi
 
 echo "[1/5] Installing binaries and the TOD module..."
-install -Dm755 "$BUILD/libtudor/libtudor.so"                    /usr/bin/tudor/libtudor.so
-install -Dm755 "$BUILD/tudor-host/tudor_host"                   /usr/bin/tudor/tudor_host
-install -Dm755 "$BUILD/tudor-host-launcher/tudor_host_launcher"  /usr/bin/tudor/tudor_host_launcher
-install -Dm755 "$BUILD/cli/tudor_cli"                           /usr/bin/tudor/tudor_cli
-install -Dm755 "$BUILD/libfprint-tod/libtudor_tod.so"           /usr/lib/libfprint-2/tod-1/libtudor_tod.so
+# Use meson's install, not a plain copy: meson rewrites the build-tree rpath
+# ($ORIGIN/../libtudor) to $ORIGIN at install time. Copying the build output by
+# hand leaves the build rpath in place, and tudor_host then cannot find
+# libtudor.so even though it sits next to it.
+meson install -C "$BUILD" --quiet
+
+# meson's udevdir is one level above where systemd-udev reads rules, so the rule
+# it installs there is inert; step 3 places the real one in rules.d.
+rm -f /usr/lib/udev/60-tudor-libfprint-tod.rules
 
 echo "[2/5] Installing systemd unit and D-Bus policy..."
 install -Dm644 "$SYNA/tudor-host-launcher/tudor-host-launcher.service" \
@@ -50,7 +54,9 @@ udevadm trigger --subsystem-match=usb
 systemctl reload dbus 2>/dev/null || systemctl restart dbus
 
 echo "[5/5] Starting the Tudor host launcher..."
-systemctl enable --now tudor-host-launcher.service
+# The launcher unit is Type=dbus with no [Install] section: it is started by
+# D-Bus activation, not enabled.
+systemctl restart tudor-host-launcher.service
 systemctl restart fprintd.service
 
 echo
