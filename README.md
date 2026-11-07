@@ -35,15 +35,36 @@ fprintd ──► libtudor_tod.so (libfprint TOD module)
 ### Build and install
 
 ```bash
-./setup.sh                                  # clone base + apply patch + build + run offline tests
+./setup.sh                                  # clone fork branch + build + run offline tests
 sudo bash scripts/install-tudor-stack.sh    # binaries, TOD module, unit, D-Bus, udev rule
 sudo omarchy setup security fingerprint     # enroll right index; writes PAM for sudo/polkit/lock
 ```
 
-`./setup.sh` applies [`patches/synaTudor-hp110-storage-ipc.patch`](patches/synaTudor-hp110-storage-ipc.patch) to
-synaTudor at `31dfdb0` and builds `libtudor`, `tudor_host`, `tudor_host_launcher`,
-`tudor_cli`, and `libtudor_tod.so`. The patch is self-contained: a clean checkout
-builds and passes all 8 offline tests.
+### Where the code lives
+
+The source changes are commits on a branch of the synaTudor fork, not a patch file:
+
+| Remote | Purpose |
+|---|---|
+| [`gavdevs/synaTudor`](https://github.com/gavdevs/synaTudor) branch `hp110-storage-ipc` | canonical copy of this work |
+| [`Popax21/synaTudor`](https://github.com/Popax21/synaTudor) | upstream |
+
+Three commits on top of upstream `31dfdb0`:
+
+1. `winapi:` the Windows APIs the HP "110" driver needs (SMBIOS, CAPI crypto,
+   USER32 window layer, WTS, `GetLocalTime`) plus the WDF dead-parent unlink fix
+2. `tudor:` vendor sensor storage — enumeration, commit, delete, erase, identity
+   tracking — including the rule that a deletion which did not happen is a failure
+3. `ipc:` report adapter failures as `IPC_MSG_RESP_ERROR` instead of `abort()`ing,
+   record listing, and `clear_storage` via `EraseDatabase`
+
+`./setup.sh` clones that branch and builds `libtudor`, `tudor_host`,
+`tudor_host_launcher`, `tudor_cli`, and `libtudor_tod.so`. A clean clone builds and
+passes all 8 offline tests. `SYNA_FORK`/`SYNA_BRANCH` override the source, e.g. to
+track upstream once this is merged.
+
+`patches/synaTudor-hp110-storage-ipc.patch` is kept as a squashed snapshot of the
+same tree for offline use; it applies to `31dfdb0` and is not needed by `setup.sh`.
 
 `fprintd` needs a `libfprint` that supports TOD modules. `packaging/` holds the two
 PKGBUILDs used here: `libfprint-tod`, and a stub literally *named* `libfprint-git`
@@ -53,7 +74,7 @@ conflicts with `libfprint-tod`. No proprietary binary is committed; the HP DLLs 
 fetched from HP's SoftPaq by
 [`scripts/fetch-hp-driver.sh`](scripts/fetch-hp-driver.sh) into git-ignored `work/`.
 
-### What the patch adds
+### What the changes cover
 
 - **HP "110" driver support** — ID tables (`00be`/`00f0`/`00df`), DLL paths, and the
   Windows APIs the 110 driver needs that upstream's 104-tuned shim lacked:
@@ -126,7 +147,7 @@ thing to try on a `00f0` unit with a stale DB2 entry.
 ├── CHANGELOG.md
 ├── setup.sh                    # clone + patch + build + offline tests (no system changes)
 ├── patches/
-│   ├── synaTudor-hp110-storage-ipc.patch  # HP 110 shims, vendor storage, IPC errors, TOD listing
+│   ├── synaTudor-hp110-storage-ipc.patch  # squashed snapshot of the fork branch (offline use)
 │   └── libfprint-synaptics-diag.patch # diagnostic patch used to prove the 00f0 root cause
 ├── scripts/
 │   ├── fetch-hp-driver.sh      # download + extract HP "110" DLLs (proprietary; not in git)
